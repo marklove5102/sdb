@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <stdbool.h>
-#include <math.h>
 #include <stdint.h>
 #include "sdb/sdb.h"
 #include "sdb/heap.h"
@@ -84,8 +83,7 @@ typedef struct Footer {
 #define ALIGNMENT 8
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 #define SDB_PAGE_SIZE 131072 // 96096*2 //sysconf(_SC_PAGESIZE)
-#define CEIL(X) ((X - (int)(X)) > 0 ? (int)(X + 1) : (int)(X))
-#define PAGES(size) (CEIL(size / (double)SDB_PAGE_SIZE))
+#define PAGES(size) (((size) + SDB_PAGE_SIZE - 1) / SDB_PAGE_SIZE)
 #define MIN_SIZE (ALIGN(sizeof(free_list) + META_SIZE))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 
@@ -106,6 +104,12 @@ static Header *remove_offset(void *ptr) {
 
 static Footer *get_footer(const Header *header_ptr) {
 	return (Footer *)((const ut8*)header_ptr + header_ptr->size - FOOTER_SIZE);
+}
+
+static inline void write_footer(Header *ptr) {
+	Footer *footer = get_footer (ptr);
+	footer->size = ptr->size;
+	footer->free = ptr->free;
 }
 
 static Footer *get_prev_footer(const Header *header_ptr) {
@@ -132,10 +136,7 @@ static Header *get_next_header(const Header *header_ptr) {
 
 static void setFree(Header *ptr, int val) {
 	ptr->free = val;
-	Footer *footer = get_footer(ptr);
-	footer->free = val;
-	// Copy size to footer size field.
-	footer->size = ptr->size;
+	write_footer (ptr);
 }
 
 // Set size in the header.
@@ -234,12 +235,12 @@ static void split(SdbHeap *heap, Header *start_header, int total, int requested)
 	bool had_next = start_header->has_next;
 	setSizeHeader(start_header, requested);
 	start_header->has_next = true;
+	write_footer (start_header);
 
 	// Add a header for newly created block (right block).
 	Header header = {block_size, FREE, true, had_next};
 	*new_block_header = header;
-	Footer footer = {block_size, FREE};
-	*get_footer(new_block_header) = footer;
+	write_footer (new_block_header);
 	// Ensure the next block (if present) points back to the new block.
 	Header *next_header = get_next_header(new_block_header);
 	if (next_header) {
@@ -285,9 +286,7 @@ static void *sdb_heap_malloc(SdbHeap *heap, int size) {
 	Header header = {(int)bytes, USED, false, false};
 	Header *header_ptr = (Header *)new_region;
 	*header_ptr = header;
-	Footer footer = {};
-	footer.free = USED;
-	*get_footer (header_ptr) = footer;
+	write_footer (header_ptr);
 
 	if (new_region == heap->last_address && heap->last_address != 0) {
 		// if we got a block of memory after the last block, as we requested.
@@ -307,7 +306,7 @@ static void *sdb_heap_malloc(SdbHeap *heap, int size) {
 	return add_offset (header_ptr);
 }
 
-static void coalesce(SdbHeap *heap, Header *current_header) {
+static Header *coalesce(SdbHeap *heap, Header *current_header) {
 	Header *merged_header = current_header;
 	Footer *merged_footer = get_footer (merged_header);
 
@@ -343,6 +342,7 @@ static void coalesce(SdbHeap *heap, Header *current_header) {
 	}
 
 	setFree (merged_header, FREE);
+	return merged_header;
 }
 
 static int unmap(SdbHeap *heap, Header *start_header, int size) {
@@ -358,8 +358,8 @@ static int unmap(SdbHeap *heap, Header *start_header, int size) {
 	}
 
 	// If this is the last block we've allocated using mmap, need to change last_address.
-	if ((void *)heap->last_address == (void *)start_header) {
-		heap->last_address = (int *)((ut8*)start_header - size);
+	if ((ut8 *)heap->last_address == (ut8 *)start_header + size) {
+		heap->last_address = (int *)start_header;
 	}
 	return munmap ((void *)start_header, (size_t)size);
 }
@@ -376,19 +376,17 @@ static void sdb_heap_free(SdbHeap *heap, void *ptr) {
 		return;
 	}
 
+	append_to_free_list (heap, start_header);
+	start_header = coalesce (heap, start_header);
 	int size = start_header->size;
 	uintptr_t addr = (uintptr_t)start_header;
-	if (size % SDB_PAGE_SIZE == 0 && (addr % SDB_PAGE_SIZE) == 0) {
-		// if: full page is free (or multiple consecutive pages), page-aligned -> can munmap it.
-		unmap (heap, start_header, size);
-	} else {
-		append_to_free_list (heap, start_header);
-		coalesce (heap, start_header);
-		// if we are left with a free block of size bigger than PAGE_SIZE that is
-		// page-aligned, munmap that part.
-		if (size >= SDB_PAGE_SIZE && (addr % SDB_PAGE_SIZE) == 0) {
-			split (heap, start_header, size, (size / SDB_PAGE_SIZE) * SDB_PAGE_SIZE);
-			unmap (heap, start_header, (size / SDB_PAGE_SIZE) * SDB_PAGE_SIZE);
+	if (size >= SDB_PAGE_SIZE && (addr % SDB_PAGE_SIZE) == 0) {
+		int unmap_size = (size / SDB_PAGE_SIZE) * SDB_PAGE_SIZE;
+		if (unmap_size == size || size - unmap_size >= (int)MIN_SIZE) {
+			if (unmap_size != size) {
+				split (heap, start_header, size, unmap_size);
+			}
+			unmap (heap, start_header, unmap_size);
 		}
 	}
 }
@@ -416,10 +414,10 @@ SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, int size) {
 		return sdb_heap_malloc (heap, size);
 	}
 	// If size is zero and ptr is not NULL, a new, minimum sized object (MIN_SIZE) is
-	// allocated and the original object is freed.
+	// treated as free().
 	if (size == 0 && ptr) {
 		sdb_heap_free (heap, ptr);
-		return sdb_heap_malloc (heap, 1);
+		return NULL;
 	}
 
 	int required_size = MAX (ALIGN (size + META_SIZE), MIN_SIZE);
@@ -460,6 +458,9 @@ SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, int size) {
 
 	// Not enough room to enlarge -> allocate new region.
 	void *new_ptr = sdb_heap_malloc (heap, size);
+	if (!new_ptr) {
+		return NULL;
+	}
 	int copy_size = payload_size < size ? payload_size : size;
 	memcpy (new_ptr, ptr, copy_size);
 
