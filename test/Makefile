@@ -28,6 +28,9 @@ asan:
 $(SCRIPTS):
 	./$@
 
+$(BINS): $(SDB_LIB)
+$(SCRIPTS): $(SDB)
+
 $(BINS):
 	$(CC) -o $@ $@.c $(LDFLAGS) $(CFLAGS) $(SDB_CFLAGS) $(SDB_LDFLAGS)
 	bash -c "time ./$@"

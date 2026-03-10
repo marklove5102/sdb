@@ -16,6 +16,8 @@ r run: all
 asan:
 	$(MAKE) CFLAGS="$(CFLAGS_ASAN)"
 
+$(OBJECTS): $(SDB_LIB)
+
 $(OBJECTS):%:%.c
 	$(CC) $(SDB_CFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(SDB_LDFLAGS)
 

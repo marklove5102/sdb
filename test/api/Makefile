@@ -13,6 +13,8 @@ asan:
 leaks:
 	$(MAKE) CFLAGS="-g -fsanitize=undefined -fsanitize=leak -fsanitize=address"
 
+array refs: $(SDB_LIB)
+
 array: array.c
 	@$(CC) -o $@ $@.c $(CFLAGS) $(LDFLAGS) $(SDB_CFLAGS) $(SDB_LDFLAGS)
 

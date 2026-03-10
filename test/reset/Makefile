@@ -1,6 +1,6 @@
 include ../sdb-test.mk
 
-all:
+all: $(SDB_LIB) $(SDB)
 	rm -f db.test
 	${SDB} db.test foo=old
 	$(CC) test-reset.c -o test-reset $(CFLAGS) $(LDFLAGS) $(SDB_CFLAGS) $(SDB_LDFLAGS)
