@@ -65,13 +65,18 @@ static bool test_heap_realloc_grows_in_place(void) {
 static bool test_heap_page_free_smoke(void) {
 	enum { EXACT_PAGE_PAYLOAD = 131056 };
 	use_custom_heap ();
-	char *ptr = sdb_gh_malloc (EXACT_PAGE_PAYLOAD);
-	mu_assert_notnull (ptr, "page-sized allocation failed");
-	memset (ptr, 0x23, EXACT_PAGE_PAYLOAD);
-	sdb_gh_free (ptr);
-	ptr = sdb_gh_malloc (32);
-	mu_assert_notnull (ptr, "allocation after page free failed");
-	sdb_gh_free (ptr);
+	for (int i = 0; i < 64; i++) {
+		char *ptr = sdb_gh_malloc (EXACT_PAGE_PAYLOAD);
+		mu_assert_notnull (ptr, "page-sized allocation failed");
+		memset (ptr, 0x23, EXACT_PAGE_PAYLOAD);
+		sdb_gh_free (ptr);
+
+		// Repeatedly remap after a full-page free to catch stale tail hints.
+		ptr = sdb_gh_malloc (32);
+		mu_assert_notnull (ptr, "allocation after page free failed");
+		memset (ptr, 0x42, 32);
+		sdb_gh_free (ptr);
+	}
 	mu_end;
 }
 

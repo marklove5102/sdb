@@ -359,7 +359,8 @@ static int unmap(SdbHeap *heap, Header *start_header, int size) {
 
 	// If this is the last block we've allocated using mmap, need to change last_address.
 	if ((ut8 *)heap->last_address == (ut8 *)start_header + size) {
-		heap->last_address = (int *)start_header;
+		// Keep the mmap tail hint only when a mapped predecessor still exists.
+		heap->last_address = prev_header ? (int *)start_header : NULL;
 	}
 	return munmap ((void *)start_header, (size_t)size);
 }

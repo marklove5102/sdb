@@ -8,6 +8,8 @@ ASANOPTS=address undefined signed-integer-overflow
 LEAKOPTS=leak
 CFLAGS_ASAN=$(addprefix -fsanitize=,$(ASANOPTS)) $(CFLAGS)
 CFLAGS_LEAK=$(addprefix -fsanitize=,$(LEAKOPTS)) -lasan -lubsan
+SAN_CFLAGS=$(addprefix -fsanitize=,$(ASANOPTS)) -fno-omit-frame-pointer -O0 -g
+HEAP_CFLAGS=-DUSE_SDB_HEAP=1
 MKDIR=mkdir
 
 all: pkgconfig include/sdb/version.h
@@ -24,7 +26,7 @@ else
 	@echo Nothing to do.
 endif
 
-.PHONY: test sdb.js pkgconfig dist w32dista asan
+.PHONY: test sdb.js pkgconfig dist w32dista asan asantest heapasan heapasantest
 
 include wasi.mk
 
@@ -42,25 +44,33 @@ wasi wasm: $(WASI_SDK)
 	file src/sdb.wasm
 
 test:
-	${MAKE} -C test
+	${MAKE} -C test all
 
 heap:
 	CFLAGS=-DUSE_SDB_HEAP=1 $(MAKE) -C src all
 
 asan:
 	$(MAKE) include/sdb/version.h
-	CC=gcc LDFLAGS="$(CFLAGS_ASAN)" CFLAGS="$(CFLAGS_ASAN)" ${MAKE} -C src all
+	CC=gcc LDFLAGS="$(SAN_CFLAGS)" CFLAGS="$(SAN_CFLAGS)" ${MAKE} -C src all WITHPIC=0
 
 asantest:
 	export ASAN_OPTIONS=detect_leaks=0 ; \
-	CC=gcc CFLAGS="$(CFLAGS_ASAN)" ${MAKE} -C test
+	CC=gcc CFLAGS="$(SAN_CFLAGS)" LDFLAGS="$(SAN_CFLAGS)" ${MAKE} -C test all
+
+heapasan:
+	$(MAKE) include/sdb/version.h
+	CC=gcc LDFLAGS="$(SAN_CFLAGS)" CFLAGS="$(HEAP_CFLAGS) $(SAN_CFLAGS)" ${MAKE} -C src all WITHPIC=0
+
+heapasantest:
+	export ASAN_OPTIONS=detect_leaks=0 ; \
+	CC=gcc CFLAGS="$(HEAP_CFLAGS) $(SAN_CFLAGS)" LDFLAGS="$(SAN_CFLAGS)" ${MAKE} -C test all
 
 leak:
 	$(MAKE) include/sdb/version.h
 	CC=gcc LDFLAGS="$(CFLAGS_LEAK)" CFLAGS="$(CFLAGS_LEAK)" $(MAKE) -C src all
 
 leaktest:
-	CC=gcc CFLAGS="$(CFLAGS_LEAK)" LDFLAGS="$(CFLAGS_LEAK)" $(MAKE) -C test
+	CC=gcc CFLAGS="$(CFLAGS_LEAK)" LDFLAGS="$(CFLAGS_LEAK)" $(MAKE) -C test all
 
 pkgconfig:
 	[ -d pkgconfig ] && ${MAKE} -C pkgconfig || true
