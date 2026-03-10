@@ -227,19 +227,32 @@ static void free_key_value(HtPPKv *kv) {
 	free (kv->value);
 }
 
-static void legacy_free_key_value_and_kv(HtPPKv *kv) {
+static HtPPKv *expected_freed_kv;
+static bool received_embedded_kv;
+
+static void free_key_value_track_kv(HtPPKv *kv) {
+	if (kv == expected_freed_kv) {
+		received_embedded_kv = true;
+	}
 	free (kv->key);
 	free (kv->value);
-	free (kv);
 }
 
-bool test_legacy_freefn_compat(void) {
-	HtPP *ht = ht_pp_new ((HtPPDupValue)strdup, legacy_free_key_value_and_kv, NULL);
+bool test_freefn_receives_embedded_kv(void) {
+	HtPP *ht = ht_pp_new ((HtPPDupValue)strdup, free_key_value_track_kv, NULL);
 	mu_assert_notnull (ht, "ht alloc failed");
 	mu_assert ("insert key1", ht_pp_insert (ht, "key1", "value1"));
-	mu_assert ("insert key2", ht_pp_insert (ht, "key2", "value2"));
+
+	bool found = false;
+	expected_freed_kv = ht_pp_find_kv (ht, "key1", &found);
+	mu_assert ("key1 should exist", found);
+	mu_assert_notnull (expected_freed_kv, "key1 kv missing");
+	received_embedded_kv = false;
+
 	mu_assert ("delete key1", ht_pp_delete (ht, "key1"));
-	ht_pp_update (ht, "key2", "value3");
+	mu_assert ("freefn should receive embedded kv", received_embedded_kv);
+
+	expected_freed_kv = NULL;
 	ht_pp_free (ht);
 	mu_end;
 }
@@ -527,7 +540,7 @@ int all_tests() {
 	mu_run_test (test_ht_grow);
 	mu_run_test (test_ht_kvp);
 	mu_run_test (test_ht_general);
-	mu_run_test (test_legacy_freefn_compat);
+	mu_run_test (test_freefn_receives_embedded_kv);
 	mu_run_test (test_empty_ht);
 	mu_run_test (test_insert);
 	mu_run_test (test_update);

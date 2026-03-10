@@ -42,20 +42,7 @@ static inline ut32 calcsize_val(HtName_(Ht) *ht, const VALUE_TYPE v) {
 
 static inline void freefn(HtName_(Ht) *ht, HT_(Kv) *kv) {
 	if (ht->opt.freefn) {
-		/*
-		 * Buckets store kv entries inline in bt->arr. Legacy free callbacks
-		 * may also free(kv), which was safe when kv objects were individually
-		 * allocated. To avoid corrupting bucket storage, run user callbacks on
-		 * a heap copy of the entry instead of on the embedded memory.
-		 */
-		HT_(Kv) *tmp = (HT_(Kv) *)sdb_gh_malloc (ht->opt.elem_size);
-		if (!tmp) {
-			/* Best effort fallback: preserve previous behavior on OOM. */
-			ht->opt.freefn (kv);
-			return;
-		}
-		memcpy (tmp, kv, ht->opt.elem_size);
-		ht->opt.freefn (tmp);
+		ht->opt.freefn (kv);
 	}
 }
 
@@ -109,7 +96,8 @@ static inline HT_(Kv) *next_kv(HtName_(Ht) *ht, HT_(Kv) *kv) {
 // == (for storing ints).
 // keydup - function to duplicate to key (eg sdb_strdup), if NULL just does strup.
 // valdup - same as keydup, but for values but if NULL just assign
-// pair_free - function for freeing a keyvaluepair - if NULL just does free.
+// pair_free - function for freeing resources owned by a keyvaluepair.
+//             Callbacks may free owned payloads, but must not free kv itself.
 // calcsize - function to calculate the size of a value. if NULL, just stores 0.
 static HtName_(Ht)* internal_ht_new(ut32 size, ut32 prime_idx, HT_(Options) *opt) {
 	HtName_(Ht)* ht = (HtName_(Ht)*)sdb_gh_calloc (1, sizeof (*ht));

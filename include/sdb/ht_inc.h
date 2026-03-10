@@ -61,6 +61,10 @@ typedef struct Ht_(kv) {
 	ut32 value_len;
 } HT_(Kv);
 
+/*
+ * Free resources owned by kv, but do not free kv itself.
+ * Hashtable entries live inline inside bucket arrays.
+ */
 typedef void (*HT_(KvFreeFunc))(HT_(Kv) *);
 typedef KEY_TYPE (*HT_(DupKey))(const KEY_TYPE);
 typedef VALUE_TYPE (*HT_(DupValue))(const VALUE_TYPE);
