@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include "sdb/sdb.h"
 #include "sdb/heap.h"
 
@@ -47,19 +48,27 @@ typedef struct free_list {
 
 typedef struct sdb_heap_t {
 	// Globals
-	int *last_address;
+	ut8 *last_address;
 	free_list *free_list_start;
 	// To reduce number of mmap calls.
-	int last_mapped_size; // 1;
+	size_t last_mapped_size; // pages, starts at 1.
 } SdbHeap;
 
 SDB_API void sdb_heap_fini(SdbHeap *heap);
-SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, int size);
+SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, size_t size);
+
+static void sdb_heap_fini_cb(void *data) {
+	sdb_heap_fini ((SdbHeap *)data);
+}
+
+static void *sdb_heap_realloc_cb(void *data, void *ptr, size_t size) {
+	return sdb_heap_realloc ((SdbHeap *)data, ptr, size);
+}
 
 static SdbHeap sdb_gh_custom_data = { NULL, NULL, 1};
 const SdbGlobalHeap sdb_gh_custom = {
-	(SdbHeapRealloc)sdb_heap_realloc,
-	(SdbHeapFini)sdb_heap_fini,
+	sdb_heap_realloc_cb,
+	sdb_heap_fini_cb,
 	&sdb_gh_custom_data
 };
 
@@ -86,6 +95,8 @@ typedef struct Footer {
 #define PAGES(size) (((size) + SDB_PAGE_SIZE - 1) / SDB_PAGE_SIZE)
 #define MIN_SIZE (ALIGN(sizeof(free_list) + META_SIZE))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+#define MAX_BLOCK_SIZE ((size_t)INT_MAX)
+#define MAX_MAPPED_PAGES (MAX_BLOCK_SIZE / SDB_PAGE_SIZE)
 
 // Meta sizes.
 #define META_SIZE ALIGN(sizeof(Header) + sizeof(Footer))
@@ -154,6 +165,35 @@ static inline void setSizeFooter(void *ptr, int size) {
 // Get size of the free list item.
 static inline int getSize(void *ptr) {
 	return remove_offset (ptr)->size;
+}
+
+static bool size_to_block_size(size_t size, int *required_size) {
+	if (size == 0 || size > MAX_BLOCK_SIZE - META_SIZE) {
+		return false;
+	}
+	size_t total = ALIGN (size + META_SIZE);
+	if (total < MIN_SIZE) {
+		total = MIN_SIZE;
+	}
+	if (total > MAX_BLOCK_SIZE) {
+		return false;
+	}
+	*required_size = (int)total;
+	return true;
+}
+
+static size_t clamp_mapped_pages(size_t mapped_pages) {
+	if (mapped_pages > MAX_MAPPED_PAGES) {
+		return MAX_MAPPED_PAGES;
+	}
+	return mapped_pages;
+}
+
+static size_t grow_mapped_pages(size_t mapped_pages) {
+	if (mapped_pages >= (MAX_MAPPED_PAGES / 2)) {
+		return MAX_MAPPED_PAGES;
+	}
+	return mapped_pages * 2;
 }
 
 static void remove_from_free_list(SdbHeap *heap, Header *block) {
@@ -249,13 +289,13 @@ static void split(SdbHeap *heap, Header *start_header, int total, int requested)
 	append_to_free_list (heap, new_block_header);
 }
 
-static void *sdb_heap_malloc(SdbHeap *heap, int size) {
-	if (size <= 0) {
+static void *sdb_heap_malloc(SdbHeap *heap, size_t size) {
+	int required_size = 0;
+	if (!size_to_block_size (size, &required_size)) {
 		return NULL;
 	}
 	// Size of the block can't be smaller than MIN_SIZE, as we need to store
 	// free list in the body + header and footer on each side respectively.
-	int required_size = MAX (ALIGN (size + META_SIZE), MIN_SIZE);
 	// Try to find a block big enough in already allocated memory.
 	free_list *free_block = find_free_block (heap, required_size);
 
@@ -273,8 +313,17 @@ static void *sdb_heap_malloc(SdbHeap *heap, int size) {
 	// No free block was found. Allocate size requested + header (in full pages).
 	// Each next allocation will be doubled in size from the previous one
 	// (to decrease the number of mmap sys calls we make).
-	size_t bytes = (size_t)MAX (PAGES (required_size), heap->last_mapped_size) * SDB_PAGE_SIZE;
-	heap->last_mapped_size *= 2;
+	size_t required_pages = PAGES ((size_t)required_size);
+	if (required_pages > MAX_MAPPED_PAGES) {
+		return NULL;
+	}
+	size_t mapped_pages = required_pages > heap->last_mapped_size
+		? required_pages
+		: heap->last_mapped_size;
+	mapped_pages = clamp_mapped_pages (mapped_pages);
+	size_t bytes = mapped_pages * SDB_PAGE_SIZE;
+	int block_size = (int)bytes;
+	heap->last_mapped_size = grow_mapped_pages (mapped_pages);
 
 	// last_address my not be returned by mmap, but makes it more efficient if it happens.
 	void *new_region = mmap (NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -283,7 +332,7 @@ static void *sdb_heap_malloc(SdbHeap *heap, int size) {
 		return NULL;
 	}
 	// Create a header/footer for new block.
-	Header header = {(int)bytes, USED, false, false};
+	Header header = {block_size, USED, false, false};
 	Header *header_ptr = (Header *)new_region;
 	*header_ptr = header;
 	write_footer (header_ptr);
@@ -299,9 +348,9 @@ static void *sdb_heap_malloc(SdbHeap *heap, int size) {
 		}
 	}
 	// Split new region.
-	split (heap, header_ptr, bytes, required_size);
+	split (heap, header_ptr, block_size, required_size);
 	// Update last_address for the next allocation.
-	heap->last_address = (int*)((ut8*)new_region + bytes);
+	heap->last_address = (ut8 *)new_region + block_size;
 	// Return address behind the header (i.e. header is hidden).
 	return add_offset (header_ptr);
 }
@@ -360,7 +409,10 @@ static int unmap(SdbHeap *heap, Header *start_header, int size) {
 	// If this is the last block we've allocated using mmap, need to change last_address.
 	if ((ut8 *)heap->last_address == (ut8 *)start_header + size) {
 		// Keep the mmap tail hint only when a mapped predecessor still exists.
-		heap->last_address = prev_header ? (int *)start_header : NULL;
+		heap->last_address = prev_header ? (ut8 *)start_header : NULL;
+		if (!heap->last_address) {
+			heap->last_mapped_size = 1;
+		}
 	}
 	return munmap ((void *)start_header, (size_t)size);
 }
@@ -409,7 +461,7 @@ SDB_API void sdb_heap_fini(SdbHeap *heap) {
 #endif
 }
 
-SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, int size) {
+SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, size_t size) {
 	// If ptr is NULL, realloc() is identical to a call to malloc() for size bytes.
 	if (!ptr) {
 		return sdb_heap_malloc (heap, size);
@@ -421,14 +473,17 @@ SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, int size) {
 		return NULL;
 	}
 
-	int required_size = MAX (ALIGN (size + META_SIZE), MIN_SIZE);
+	int required_size = 0;
+	if (!size_to_block_size (size, &required_size)) {
+		return NULL;
+	}
 	// If there is enough space, expand the block.
 	Header *current_header = remove_offset (ptr);
 	int current_size = current_header->size;
 	int payload_size = current_size - HEADER_SIZE - FOOTER_SIZE;
 
 	// if user requests to shorten the block.
-	if (size <= payload_size) {
+	if (size <= (size_t)payload_size) {
 		return ptr;
 	}
 	Footer *current_footer = get_footer (current_header);
@@ -462,7 +517,7 @@ SDB_API void *sdb_heap_realloc(SdbHeap *heap, void *ptr, int size) {
 	if (!new_ptr) {
 		return NULL;
 	}
-	int copy_size = payload_size < size ? payload_size : size;
+	size_t copy_size = (size_t)payload_size < size ? (size_t)payload_size : size;
 	memcpy (new_ptr, ptr, copy_size);
 
 	// Free old location.
